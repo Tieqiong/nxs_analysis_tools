@@ -1,0 +1,196 @@
+---
+name: nexus-chess-formats
+description: >-
+  NeXus and HDF5 data structures, CHESS beamline directory conventions, lazy loading mechanics with NXlink/NXfield, temperature key normalization, and XTEC data integration for nxs-analysis-tools.
+---
+
+# NeXus & CHESS Data Formats (`nexus-chess-formats`)
+
+This skill documents domain knowledge, file structure conventions, lazy loading behaviors, and testing patterns for NeXus data in `nxs-analysis-tools`.
+
+---
+
+## 1. Directory Structures & Format Detection
+
+`nxs-analysis-tools` primarily works with two distinct beamline data formats. **NXRefine and legacy CHESS formats are never mixed in the same sample directory.**
+
+### A. NXRefine Format
+- **Directory Layout**:
+  ```text
+  sample_directory/
+  ├── cubic_15.nxs          <-- Top-level wrapper NeXus file
+  ├── cubic_25.nxs
+  ├── 15/
+  │   └── transform.nxs     <-- Raw reciprocal space volume
+  └── 25/
+      └── transform.nxs
+  ```
+- **NeXus Schema**:
+  - Top-level wrapper (`cubic_15.nxs`) contains an `NXentry` named `entry` and an `NXdata` group named `transform`.
+  - The signal dataset `transform.data` is an `NXlink` pointing to `<temperature>/transform.nxs` at target `/entry/data/v`.
+  - Axes are ordered `[Ql, Qk, Qh]` (C-contiguous reciprocal space coordinates).
+- **Detection Pattern**: Files matching `*_(\d+(?:[p.]\d+)?)\.nxs` directly in `sample_directory`.
+
+### B. Legacy CHESS Format
+- **Directory Layout**:
+  ```text
+  sample_directory/
+  ├── 15/
+  │   └── data_hkli.nxs     <-- Data file ending with 'hkli.nxs' (or custom)
+  ├── 25/
+  │   └── data_hkli.nxs
+  ```
+- **NeXus Schema**:
+  - The file contains `entry/data` with signal `counts` and axes `H`, `K`, `L`.
+- **Detection Pattern**: Subdirectories named `<temperature>` containing `.nxs` files matching the specified `file_ending` (default `'hkli.nxs'`).
+
+---
+
+## 2. Lazy Loading Mechanics in `nexusformat`
+
+Understanding `nexusformat`'s memory model is essential to avoiding out-of-memory errors when processing multi-temperature 3D volumes.
+
+### Why `nxload` is Lazy
+When `nexusformat.nexus.nxload(path)` is called, the file structure is traversed, but **underlying array data is not loaded into RAM**:
+- An `NXfield` or `NXlinkfield` backed by an HDF5 dataset initializes with `_value = None`.
+- Accessing `.nxdata` forces an eager read of the entire multidimensional array into memory.
+- Slicing with `data[slice_obj]` reads **only the requested hyperslab** directly from disk via HDF5 chunking, keeping the rest of the array unloaded.
+
+### Avoiding Eager Loads in NXRefine
+- When loading NXRefine data, always use `use_nxlink=True` (default in `load_transform` and `load_datasets`).
+- Setting `use_nxlink=False` calls `.nxdata.transpose(2, 1, 0)`, which pulls the entire 1–2 GB volume per temperature into memory upfront.
+- With `use_nxlink=True`, `root.entry.transform` retains the `NXlink` pointer, using $O(1)$ memory until sliced (e.g., via `Scissors.cut_data()`).
+
+### Legacy CHESS Datasets Are Already Lazy
+- Datasets loaded via `load_data()` return `g.entry.data`.
+- Accessing groups or fields (e.g. `data = nx_obj.entry.data`, `counts = data.counts`) merely traverses the NeXus/HDF5 hierarchy and maintains `_value = None`—it does **NOT** load array data into RAM.
+- Because `load_data()` never accesses `.nxdata`, legacy datasets are natively lazy and never load full 3D arrays into RAM upfront.
+
+### Mandatory Rule: Lazy Slicing vs. Eager Loading
+To protect memory integrity and prevent out-of-memory crashes on interactive and batch nodes:
+1. **Tree Traversal is Lazy**: Assigning `data = nx_obj.entry.data` or referencing field names (`data.counts`) does not trigger I/O reads.
+2. **Eager Triggers (Strictly Prohibited on Full 3D Volumes)**:
+   - Calling `.nxdata` directly on the unsliced 3D field (e.g., `data.counts.nxdata`, `data.nxsignal.nxdata`).
+   - Casting the unsliced 3D dataset to NumPy via `np.asarray(data.counts)`.
+   - Passing a full 3D `NXdata` to `plot_slice(data, sum_axis=...)`. Because `plot_slice()` executes `raw_data = data.nxsignal.nxdata` internally when `sum_axis` is specified, it eagerly reads the entire 3D volume into memory.
+3. **Mandatory Lazy Slicing Protocol**:
+   - Always slice the hyperslab **before** accessing numerical data or passing to visualization routines.
+   - Slicing `data[slice_obj]` or `counts_field[slice_obj]` triggers `NXfield.__getitem__`, reading **only the requested 2D hyperslab** from disk via HDF5 chunking without loading the rest of the 3D array into RAM.
+   - For 2D slice visualization, either pass the sliced 2D `NXdata` (e.g., `data[:, :, 0.0]`) to `plot_slice()`, or construct a 2D `NXdata` slice (`NXdata(NXfield(slice_2d), (axis_x, axis_y))`) and pass it without `sum_axis`.
+
+---
+
+## 3. Reciprocal Space Planes vs. Array Axes Slicing
+
+A common source of confusion when slicing 3D reciprocal space volumes is confusing the **plane name** with the **sliced coordinate**:
+- A reciprocal lattice plane is defined by **fixing the coordinate perpendicular to the plane**:
+  - **$HK$ Plane**: $L$ (or $Q_l$) is held constant (e.g., $L = 0.0$). The remaining free axes are $H$ and $K$.
+  - **$HL$ Plane**: $K$ (or $Q_k$) is held constant (e.g., $K = 0.0$). The remaining free axes are $H$ and $L$.
+  - **$KL$ Plane**: $H$ (or $Q_h$) is held constant (e.g., $H = 0.0$). The remaining free axes are $K$ and $L$.
+
+> [!WARNING]
+> Fixing $Q_h = 0.0$ ($H = 0.0$) does **NOT** yield the $HK$ plane! It eliminates the $H$ coordinate, resulting in the **$KL$ plane**. To observe the **$HK$ plane**, you must slice at $Q_l = 0.0$ ($L = 0.0$).
+
+### Mapping to Array Axes under `use_nxlink=True`
+With `use_nxlink=True` (the default), NXRefine datasets preserve their native C-order axes:
+`data.nxaxes == ['Ql', 'Qk', 'Qh']` (shape: `(N_l, N_k, N_h)`).
+- **$HK$ Plane ($Q_l = 0.0$)**: Slice along **Axis 0**:
+  ```python
+  plot_slice(data[0.0, :, :])
+  ```
+- **$HL$ Plane ($Q_k = 0.0$)**: Slice along **Axis 1**:
+  ```python
+  plot_slice(data[:, 0.0, :])
+  ```
+- **$KL$ Plane ($Q_h = 0.0$)**: Slice along **Axis 2**:
+  ```python
+  plot_slice(data[:, :, 0.0])
+  ```
+
+### `Scissors` & `cut_data()` `center` / `window` Ordering
+Because `Scissors.cut_data()` maps `center` and `window` tuples positionally to `data.nxaxes`, when `use_nxlink=True`, coordinates must match the dataset axis order `(Ql, Qk, Qh)`:
+- `center = (L_center, K_center, H_center)`
+- `window = (L_window, K_window, H_window)`
+
+For example, to perform a linecut along $H$ centered at $H = -0.5$ with integration windows $\pm 0.2$ along $L$ and $K$:
+```python
+# center and window ordered as (L, K, H):
+xtl.cut_data(center=(0.0, 0.0, -0.5), window=(0.2, 0.2, 0.25))
+```
+Here `window[2] = 0.25` is the largest window, selecting `Qh` as the linecut axis.
+
+---
+
+## 4. Temperature Key Conventions & Normalization
+
+Beamline files encode temperatures in three equivalent notations:
+1. **Integer**: `15`, `300`
+2. **Float**: `15.5`, `25.0`
+3. **Filesystem 'p' Notation**: `'15p5'` (used in filenames to avoid decimal points)
+
+### Normalization Pattern
+Use `_normalize_temperature(val)` from `chess.py`:
+- Converts `'15p5'` $\rightarrow$ `15.5`
+- Converts `'15.0'` $\rightarrow$ `15` (whole floats to int)
+- Converts `15.5` $\rightarrow$ `15.5`
+
+### Transparent Access via `TempDict`
+`TempDependence.datasets` and related containers use `TempDict`:
+- Any temperature can be accessed using `int`, `float`, or `str` format interchangeably:
+  ```python
+  td.datasets[15.5] == td.datasets['15.5'] == td.datasets['15p5']
+  ```
+- `td.temperatures` is a sorted list of numeric keys (`int` if whole, `float` otherwise).
+- Heatmap and order parameter plots preserve floating point precision (never cast temperature keys to `int` when plotting).
+
+---
+
+## 4. Multi-Dataset Stacking & XTEC Export
+
+`TempDependence.to_xtec()` compiles 3D temperature datasets into a 4D `NXdata` structure:
+- **Axis 0**: Temperature (`Te`, units `K`).
+- **Axes 1, 2, 3**: Spatial reciprocal space axes (`Qh`, `Qk`, `Ql`).
+- When constructing stacked NeXus objects, always copy attributes (`units`, `long_name`, `angles`) from the underlying fields.
+
+---
+
+## 5. Synthetic Testing Fixtures
+
+When writing unit tests in `tests/`, use synthetic NeXus structures to avoid network downloads or large binary dependencies:
+
+```python
+from nexusformat.nexus import NXroot, NXentry, NXdata, NXfield, NXlink, nxsave
+import numpy as np
+
+def create_synthetic_legacy_file(filepath):
+    root = NXroot()
+    root['entry'] = NXentry()
+    h = NXfield(np.linspace(0, 1, 10), name='H')
+    k = NXfield(np.linspace(0, 1, 10), name='K')
+    l = NXfield(np.linspace(0, 1, 10), name='L')
+    counts = NXfield(np.ones((10, 10, 10), dtype=np.float32), name='counts')
+    root['entry']['data'] = NXdata(counts, (h, k, l))
+    nxsave(filepath, root)
+
+def create_synthetic_nxrefine_structure(tmp_path, temp=15):
+    # Raw transform file
+    subfolder = tmp_path / str(temp)
+    subfolder.mkdir(parents=True, exist_ok=True)
+    raw_path = subfolder / 'transform.nxs'
+    
+    raw_root = NXroot()
+    raw_root['entry'] = NXentry()
+    raw_root['entry']['data'] = NXdata(NXfield(np.ones((10, 10, 10), dtype=np.float32), name='v'))
+    nxsave(str(raw_path), raw_root)
+    
+    # Top-level wrapper file
+    wrapper_path = tmp_path / f"sample_{temp}.nxs"
+    w = NXroot()
+    w['entry'] = NXentry()
+    w['entry']['transform'] = NXdata(
+        NXlink(name='data', target='/entry/data/v', file=f"{temp}/transform.nxs"),
+        (NXfield(np.arange(10), name='Ql'), NXfield(np.arange(10), name='Qk'), NXfield(np.arange(10), name='Qh'))
+    )
+    nxsave(str(wrapper_path), w)
+    return wrapper_path
+```

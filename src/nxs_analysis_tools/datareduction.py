@@ -17,7 +17,7 @@ from IPython.display import display, Markdown, HTML, Image
 from nexusformat.nexus import NXfield, NXdata, nxload, NeXusError, NXroot, NXentry, nxsave
 from scipy.ndimage import rotate, zoom
 
-from .lineartransformations import ShearTransformer
+from .lineartransformations import ShearTransformer, rotate_plane_affine
 
 
 # Specify items on which users are allowed to perform standalone imports
@@ -57,7 +57,7 @@ def load_data(path, print_tree=True):
     return g.entry.data
 
 
-def load_transform(path, print_tree=True, use_nxlink=False):
+def load_transform(path, print_tree=True, use_nxlink=True):
     """
     Load transform data from an nxrefine output file.
 
@@ -70,9 +70,10 @@ def load_transform(path, print_tree=True, use_nxlink=False):
         If True, prints the NeXus data tree upon loading. Default is True.
 
     use_nxlink : bool, optional
-        If True, maintains the NXlink defined in the data file, which references
+        If True (default), maintains the NXlink defined in the data file, which references
         the raw data in the transform.nxs file. This saves memory when working with
-        many datasets. In this case, the axes are in reverse order. Default is False.
+        many datasets. In this case, the axes are in reverse order (Ql, Qk, Qh).
+        Default is True.
 
     Returns
     -------
@@ -286,6 +287,7 @@ def plot_slice(data, X=None, Y=None, sum_axis=None, transpose=False, vmin=None, 
                xticks=None, yticks=None, cbar=True, logscale=False,
                symlogscale=False, cmap='viridis', linthresh=1,
                title=None, mdheading=None, cbartitle=None,
+               normalize=True, empty_bins='both',
                **kwargs):
     """
     Plot a 2D slice of the provided dataset, with optional transformations
@@ -361,6 +363,17 @@ def plot_slice(data, X=None, Y=None, sum_axis=None, transpose=False, vmin=None, 
         The title for the colorbar. If None, the colorbar label will be set to
          the name of the signal.
 
+    normalize : bool, optional
+        Whether to normalize the summed data by the number of non-empty bins along
+        `sum_axis`. Only invoked when `data` has dimension higher than 2D and is
+        reduced via `sum_axis`. Default is True.
+
+    empty_bins : {'both', 'nan', 'none'}, optional
+        Defines which bins are considered empty when counting valid bins for normalization:
+        - 'both': Ignore NaNs and zeros. (Default)
+        - 'nan': Ignore only NaNs.
+        - 'none': Count all voxels along `sum_axis` regardless of content.
+
     **kwargs
         Additional keyword arguments passed to `pcolormesh`.
 
@@ -394,17 +407,46 @@ def plot_slice(data, X=None, Y=None, sum_axis=None, transpose=False, vmin=None, 
             raise ValueError("sum_axis must be specified when data.ndim == 3.")
 
         if is_array:
-            data = data.sum(axis=sum_axis)
+            raw_data = data
         elif is_nxdata:
-            arr = data.nxsignal.nxdata
-            arr = arr.sum(axis=sum_axis)
+            raw_data = data.nxsignal.nxdata
 
+        if normalize:
+            if np.issubdtype(raw_data.dtype, np.floating):
+                isnan_mask = np.isnan(raw_data)
+            else:
+                isnan_mask = np.zeros_like(raw_data, dtype=bool)
+
+            if empty_bins == 'nan':
+                valid_mask = ~isnan_mask
+            elif empty_bins == 'both':
+                valid_mask = ~isnan_mask & (raw_data != 0)
+            elif empty_bins == 'none':
+                valid_mask = np.ones_like(raw_data, dtype=bool)
+            else:
+                raise ValueError(f"Unknown empty_bins option '{empty_bins}'. Expected 'both', 'nan', or 'none'.")
+
+            # Count valid bins along sum_axis
+            bin_counts = np.sum(valid_mask, axis=sum_axis)
+
+            # Sum intensities ignoring invalid bins
+            data_sum = np.nansum(np.where(valid_mask, raw_data, 0), axis=sum_axis)
+
+            # Avoid divide-by-zero where bin_counts == 0
+            with np.errstate(divide='ignore', invalid='ignore'):
+                reduced = np.where(bin_counts > 0, data_sum / bin_counts, 0.0)
+        else:
+            reduced = raw_data.sum(axis=sum_axis)
+
+        if is_array:
+            data = reduced
+        elif is_nxdata:
             # Create a 2D template from the original nxdata
             slice_obj = [slice(None)] * len(data.shape)
             slice_obj[sum_axis] = 0
 
             # Use the 2D template to create a new nxdata
-            data = array_to_nxdata(arr, data[slice_obj])
+            data = array_to_nxdata(reduced, data[slice_obj])
 
     if data.ndim != 2:
         raise ValueError("Slice data must be 2D.")
@@ -811,12 +853,10 @@ class Scissors:
         Set the extents of the integration window.
     get_window()
         Get the extents of the integration window.
-    cut_data(center=None, window=None, axis=None, verbose=False)
+    cut_data(center=None, window=None, axis=None, verbose=False, normalize=False, empty_bins='both')
         Reduce data to a 1D linecut using the integration window.
-    highlight_integration_window(data=None, label=None, highlight_color='red', **kwargs)
-        Plot the integration window highlighted on a 2D heatmap of the full dataset.
     plot_integration_window(**kwargs)
-        Plot a 2D heatmap of the integration window data.
+        Plot the integration window on a 2D heatmap.
     """
 
     def __init__(self, data=None, center=None, window=None, axis=None):
@@ -876,6 +916,9 @@ class Scissors:
         center : tuple
             Central coordinate around which to perform the linecut.
         """
+        # Make sure center matches data dimensions
+        if len(center) != self.data.ndim:
+            raise ValueError(f"Center length ({len(center)}) must match dimensions of dataset ({self.data.ndim}).")
         self.center = tuple(float(i) for i in center) if center is not None else None
 
     def set_window(self, window, axis=None, verbose=False):
@@ -893,6 +936,9 @@ class Scissors:
             Enables printout of linecut axis and integrated axes. Default False.
 
         """
+        if len(window) != self.data.ndim:
+            raise ValueError(f"Window length ({len(window)}) must match dimensions of dataset ({self.data.ndim}).")
+        
         self.window = tuple(float(i) for i in window) if window is not None else None
 
         # Determine the axis for integration
@@ -917,7 +963,8 @@ class Scissors:
         """
         return self.window
 
-    def cut_data(self, center=None, window=None, axis=None, verbose=False):
+    def cut_data(self, center=None, window=None, axis=None, verbose=False,
+                 normalize=False, empty_bins='both'):
         """
         Reduces data to a 1D linecut with integration extents specified by the
         window about a central coordinate.
@@ -933,8 +980,16 @@ class Scissors:
         axis : int or None, optional
             The axis along which to perform the linecut. If not specified, the value from the
             object's attribute will be used.
-        verbose : bool
+        verbose : bool, optional
             Enables printout of linecut axis and integrated axes. Default False.
+        normalize : bool, optional
+            Whether to normalize the linecut by the number of non-empty bins along the
+            integrated directions. Default False.
+        empty_bins : {'both', 'nan', 'none'}, optional
+            Defines which bins are considered empty when counting valid bins for normalization:
+            - 'both': Ignore NaNs and zeros. (Default)
+            - 'nan': Ignore only NaNs.
+            - 'none': Count all voxels within the integration window.
 
         Returns
         -------
@@ -963,184 +1018,141 @@ class Scissors:
         self.integration_volume = data[slice_obj]
         self.integration_volume.nxname = data.nxname
 
-        # Perform integration along the integrated axes
-        integrated_data = np.sum(self.integration_volume.nxsignal.nxdata,
-                                 axis=self.integrated_axes)
+        raw_data = self.integration_volume.nxsignal.nxdata
+
+        if normalize:
+            # Determine valid mask
+            if empty_bins == 'nan':
+                valid_mask = ~np.isnan(raw_data)
+            elif empty_bins == 'both':
+                valid_mask = ~np.isnan(raw_data) & (raw_data != 0)
+            elif empty_bins == 'none':
+                valid_mask = np.ones_like(raw_data, dtype=bool)
+            else:
+                raise ValueError(f"Unknown empty_bins option '{empty_bins}'. Expected 'both', 'nan', or 'none'.")
+
+            # Count valid bins along integrated axes
+            bin_counts = np.sum(valid_mask, axis=self.integrated_axes)
+
+            # Sum intensities ignoring invalid bins
+            data_sum = np.nansum(np.where(valid_mask, raw_data, 0), axis=self.integrated_axes)
+
+            # Avoid divide-by-zero where bin_counts == 0
+            with np.errstate(divide='ignore', invalid='ignore'):
+                integrated_data = np.where(bin_counts > 0, data_sum / bin_counts, 0.0)
+        else:
+            # Perform integration along the integrated axes
+            integrated_data = np.sum(raw_data, axis=self.integrated_axes)
 
         # Create an NXdata object for the linecut data
         self.linecut = NXdata(NXfield(integrated_data, name=self.integration_volume.nxsignal.nxname),
                               self.integration_volume[self.integration_volume.nxaxes[self.axis].nxname])
         self.linecut.nxname = self.integration_volume.nxname
+        self.linecut.attrs['normalized'] = normalize
 
         return self.linecut
 
-    def highlight_integration_window(self, data=None, width=None, height=None,
-                                     label=None, highlight_color='red', **kwargs):
+    def plot_integration_window(self, data=None, show_highlight=True, width=None, height=None,
+                                label=None, highlight_color='red', **kwargs):
         """
-        Plots the integration window highlighted on the three principal 2D cross-sections of a 3D dataset.
+        Plots the principal 2D cross-sections of the dataset, centered around the linecut.
 
         Parameters
         ----------
         data : array-like, optional
-            The 3D dataset to visualize. If not provided, uses `self.data`.
+            The dataset to visualize. If not provided, defaults to `self.data`.
+        show_highlight : bool, optional
+            Whether to overlay a rectangle highlighting the integration window. Default is True.
         width : float, optional
-            Width of the visible x-axis range in each subplot. Used to zoom in on the integration region.
+            Width of the visible x-axis range to zoom in on the integration region.
         height : float, optional
-            Height of the visible y-axis range in each subplot. Used to zoom in on the integration region.
+            Height of the visible y-axis range to zoom in on the integration region.
         label : str, optional
-            Label for the rectangle patch marking the integration window, used in the legend.
+            Label for the rectangle patch used in the legend.
         highlight_color : str, optional
             Color of the rectangle edges highlighting the integration window. Default is 'red'.
         **kwargs : dict, optional
-            Additional keyword arguments passed to `plot_slice` for customizing the plot (e.g., cmap, vmin, vmax).
+            Additional keyword arguments passed to `plot_slice` (e.g., cmap, vmin, vmax).
 
         Returns
         -------
-        p1, p2, p3 : :class:`matplotlib.collections.QuadMesh`
-            The plotted QuadMesh objects for the three cross-sections:
-            XY at fixed Z, XZ at fixed Y, and YZ at fixed X.
-
+        plots : tuple of :class:`matplotlib.collections.QuadMesh`
+            The plotted QuadMesh objects. Returns a single object for 2D, or three for 3D.
         """
         data = self.data if data is None else data
         center = self.center
-        window = self.window
+        window = getattr(self, 'window', None)
+        ndim = len(data.nxaxes)
 
-        # Create a figure and subplots
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        # Define the layout and views based on dimensions
+        if ndim == 2:
+            fig, axes = plt.subplots(1, 1, figsize=(6, 5))
+            axes = [axes]  # Make iterable for the loop
+            views = [{'slice_idx': None, 'x_idx': 0, 'y_idx': 1}]
+        elif ndim == 3:
+            fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+            views = [
+                {'slice_idx': 2, 'x_idx': 0, 'y_idx': 1},  # XY plane (slice Z)
+                {'slice_idx': 1, 'x_idx': 0, 'y_idx': 2},  # XZ plane (slice Y)
+                {'slice_idx': 0, 'x_idx': 1, 'y_idx': 2}   # YZ plane (slice X)
+            ]
+        else:
+            raise ValueError(f"Plotting is only supported for 2D or 3D data. Found {ndim}D.")
 
-        # Plot cross-section 1
-        slice_obj = [slice(None)] * data.ndim
-        slice_obj[2] = center[2]
+        plots = []
 
-        p1 = plot_slice(data[slice_obj],
-                        X=data.nxaxes[0],
-                        Y=data.nxaxes[1],
-                        ax=axes[0],
-                        **kwargs)
-        ax = axes[0]
-        rect_diffuse = patches.Rectangle(
-            (center[0] - window[0],
-             center[1] - window[1]),
-            2 * window[0], 2 * window[1],
-            linewidth=1, edgecolor=highlight_color,
-            facecolor='none', transform=p1.get_transform(), label=label,
-        )
-        ax.add_patch(rect_diffuse)
+        # Loop through the necessary views and generate plots
+        for ax, view in zip(axes, views):
+            x_idx, y_idx = view['x_idx'], view['y_idx']
+            slice_idx = view['slice_idx']
 
-        if 'xlim' not in kwargs and width is not None:
-            ax.set(xlim=(center[0] - width / 2, center[0] + width / 2))
-        if 'ylim' not in kwargs and height is not None:
-            ax.set(ylim=(center[1] - height / 2, center[1] + height / 2))
+            # Prepare the slice for 3D data
+            if slice_idx is not None:
+                slice_obj = [slice(None)] * ndim
+                slice_obj[slice_idx] = center[slice_idx]
+                plot_data = data[slice_obj]
+            else:
+                plot_data = data
 
-        # Plot cross-section 2
-        slice_obj = [slice(None)] * data.ndim
-        slice_obj[1] = center[1]
+            X = data.nxaxes[x_idx]
+            Y = data.nxaxes[y_idx]
 
-        p2 = plot_slice(data[slice_obj],
-                        X=data.nxaxes[0],
-                        Y=data.nxaxes[2],
-                        ax=axes[1],
-                        **kwargs)
-        ax = axes[1]
-        rect_diffuse = patches.Rectangle(
-            (center[0] - window[0],
-             center[2] - window[2]),
-            2 * window[0], 2 * window[2],
-            linewidth=1, edgecolor=highlight_color,
-            facecolor='none', transform=p2.get_transform(), label=label,
-        )
-        ax.add_patch(rect_diffuse)
+            # Generate the QuadMesh plot
+            p = plot_slice(plot_data, X=X, Y=Y, ax=ax, **kwargs)
+            plots.append(p)
 
-        if 'xlim' not in kwargs and width is not None:
-            ax.set(xlim=(center[0] - width / 2, center[0] + width / 2))
-        if 'ylim' not in kwargs and height is not None:
-            ax.set(ylim=(center[2] - height / 2, center[2] + height / 2))
+            # Apply aspect ratio logic
+            len_x = len(X.nxdata) if hasattr(X, 'nxdata') else len(X)
+            len_y = len(Y.nxdata) if hasattr(Y, 'nxdata') else len(Y)
+            ax.set_aspect(len_x / len_y)
 
-        # Plot cross-section 3
-        slice_obj = [slice(None)] * data.ndim
-        slice_obj[0] = center[0]
+            # Apply the highlight window if requested
+            if show_highlight and window is not None and center is not None:
+                cx, cy = center[x_idx], center[y_idx]
+                wx, wy = window[x_idx], window[y_idx]
 
-        p3 = plot_slice(data[slice_obj],
-                        X=data.nxaxes[1],
-                        Y=data.nxaxes[2],
-                        ax=axes[2],
-                        **kwargs)
-        ax = axes[2]
-        rect_diffuse = patches.Rectangle(
-            (center[1] - window[1],
-             center[2] - window[2]),
-            2 * window[1], 2 * window[2],
-            linewidth=1, edgecolor=highlight_color,
-            facecolor='none', transform=p3.get_transform(), label=label,
-        )
-        ax.add_patch(rect_diffuse)
+                rect = patches.Rectangle(
+                    (cx - wx, cy - wy), 2 * wx, 2 * wy,
+                    linewidth=1, edgecolor=highlight_color,
+                    facecolor='none', transform=p.get_transform(), label=label
+                )
+                ax.add_patch(rect)
 
-        # If width and height are provided, center the view on the linecut area
-        if 'xlim' not in kwargs and width is not None:
-            ax.set(xlim=(center[1] - width / 2, center[1] + width / 2))
-        if 'ylim' not in kwargs and height is not None:
-            ax.set(ylim=(center[2] - height / 2, center[2] + height / 2))
+            # Handle zooming
+            if center is not None:
+                cx, cy = center[x_idx], center[y_idx]
+                if 'xlim' not in kwargs and width is not None:
+                    ax.set_xlim((cx - width / 2, cx + width / 2))
+                if 'ylim' not in kwargs and height is not None:
+                    ax.set_ylim((cy - height / 2, cy + height / 2))
 
-        # Adjust subplot padding
-        fig.subplots_adjust(wspace=0.5)
+            if label is not None and show_highlight:
+                ax.legend()
 
-        if label is not None:
-            [ax.legend() for ax in axes]
-
+        fig.subplots_adjust(wspace=0.3 if ndim == 3 else 0.1)
         plt.show()
 
-        return p1, p2, p3
-
-    def plot_integration_window(self, **kwargs):
-        """
-        Plots the three principal cross-sections of the integration volume on a single figure.
-
-        Parameters
-        ----------
-        **kwargs : keyword arguments, optional
-            Additional keyword arguments to customize the plot.
-        """
-        data = self.integration_volume
-        center = self.center
-
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-
-        # Plot cross-section 1
-        slice_obj = [slice(None)] * data.ndim
-        slice_obj[2] = center[2]
-        p1 = plot_slice(data[slice_obj],
-                        X=data.nxaxes[0],
-                        Y=data.nxaxes[1],
-                        ax=axes[0],
-                        **kwargs)
-        axes[0].set_aspect(len(data.nxaxes[0].nxdata) / len(data.nxaxes[1].nxdata))
-
-        # Plot cross section 2
-        slice_obj = [slice(None)] * data.ndim
-        slice_obj[1] = center[1]
-        p3 = plot_slice(data[slice_obj],
-                        X=data.nxaxes[0],
-                        Y=data.nxaxes[2],
-                        ax=axes[1],
-                        **kwargs)
-        axes[1].set_aspect(len(data.nxaxes[0].nxdata) / len(data.nxaxes[2].nxdata))
-
-        # Plot cross-section 3
-        slice_obj = [slice(None)] * data.ndim
-        slice_obj[0] = center[0]
-        p2 = plot_slice(data[slice_obj],
-                        X=data.nxaxes[1],
-                        Y=data.nxaxes[2],
-                        ax=axes[2],
-                        **kwargs)
-        axes[2].set_aspect(len(data.nxaxes[1].nxdata) / len(data.nxaxes[2].nxdata))
-
-        # Adjust subplot padding
-        fig.subplots_adjust(wspace=0.3)
-
-        plt.show()
-
-        return p1, p2, p3
+        return tuple(plots)
 
 
 def reciprocal_lattice_params(lattice_params):
@@ -1294,34 +1306,22 @@ def rotate_data(data, lattice_angle, rotation_angle, rotation_axis=None, rotatio
         elif data.ndim == 2:
             sliced_data = data
 
-        # Add padding to avoid data cutoff during rotation
-        p = Padder(sliced_data)
-        padding = tuple(len(axis) for axis in sliced_data.nxaxes)
-        counts = p.pad(padding)
-        counts = p.padded.nxsignal
+        q1 = sliced_data.nxaxes[0].nxdata
+        q2 = sliced_data.nxaxes[1].nxdata
+        dq1 = float((q1[-1] - q1[0]) / (len(q1) - 1)) if len(q1) > 1 else 1.0
+        dq2 = float((q2[-1] - q2[0]) / (len(q2) - 1)) if len(q2) > 1 else 1.0
+        c = np.array([-q1[0] / dq1, -q2[0] / dq2], dtype=float)
 
-        # Skew data to match lattice angle
-        t = ShearTransformer(lattice_angle)
-        counts = t.apply(counts)
-
-        # Apply coordinate aspect ratio correction
-        # More resolution along y = more squeezing needed along y
-        # More resolution along x = less squeezing needed along y
-        y_res = sliced_data.shape[1] / (sliced_data.nxaxes[1].max() - sliced_data.nxaxes[1].min())
-        x_res = sliced_data.shape[0] / (sliced_data.nxaxes[0].max() - sliced_data.nxaxes[0].min())
-        counts = zoom(counts, zoom=(1, aspect * x_res / y_res), order=aspect_order)
-
-        # Perform rotation
-        counts = rotate(counts, rotation_angle, reshape=False, order=rotation_order)
-
-        # Undo aspect ratio correction
-        counts = zoom(counts, zoom=(1, 1 / (aspect * x_res / y_res)), order=aspect_order)
-
-        # Undo skew transformation
-        counts = t.invert(counts)
-
-        # Remove padding
-        counts = p.unpad(counts)
+        counts = rotate_plane_affine(
+            sliced_data.nxsignal.nxdata,
+            lattice_angle=lattice_angle,
+            rotation_angle=rotation_angle,
+            dq1=dq1,
+            dq2=dq2,
+            origin=c,
+            aspect=aspect,
+            order=rotation_order
+        )
 
         # Write slice
         if data.ndim == 3:
@@ -1329,44 +1329,13 @@ def rotate_data(data, lattice_angle, rotation_angle, rotation_axis=None, rotatio
             index[rotation_axis] = i
             output_array[tuple(index)] = counts
         elif data.ndim == 2:
-            output_array = counts
+            output_array[:] = counts
+            
+    if printout:
+        print('\nRotation completed.')
 
-    print('\nRotation completed.')
-
-    return NXdata(NXfield(output_array, name=p.padded.nxsignal.nxname),
+    return NXdata(NXfield(output_array, name=data.nxsignal.nxname),
                   ([axis for axis in data.nxaxes]))
-
-
-
-def rotate_data_2D(data, lattice_angle, rotation_angle):
-    """
-    DEPRECATED: Use `rotate_data` instead.
-
-    Rotates 2D data.
-
-    Parameters
-    ----------
-    data : :class:`nexusformat.nexus.tree.NXdata`
-        Input data.
-    lattice_angle : float
-        Angle between the two in-plane lattice axes in degrees.
-    rotation_angle : float
-        Angle of rotation in degrees.
-
-    Returns
-    -------
-    rotated_data : :class:`nexusformat.nexus.tree.NXdata`
-        Rotated data as an NXdata object.
-    """
-    warnings.warn(
-        "rotate_data_2D is deprecated and will be removed in a future release. "
-        "Use rotate_data instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-
-    # Call the new general function
-    return rotate_data(data, lattice_angle=lattice_angle, rotation_angle=rotation_angle)
 
 
 class Padder:
@@ -1384,7 +1353,7 @@ class Padder:
     steps : tuple or None
         The step sizes along each axis of the dataset.
     maxes : tuple or None
-        The maximum values along each axis of the dataset.
+        The maximum values along each axis of the unpadded dataset.
 
     Methods
     -------
@@ -1533,13 +1502,58 @@ def load_discus_nxs(path):
         and the signal labeled 'counts'.
 
     """
-    filename = path
-    root = nxload(filename)
+def load_discus_nxs(path):
+    """
+    Load .nxs format data from the DISCUS program (by T. Proffen and R. Neder)
+    and convert it to the CHESS format.
+
+    Supports both 2D and 3D datasets.
+
+    Parameters
+    ----------
+    path : str
+        The file path to the .nxs file generated by DISCUS.
+
+    Returns
+    -------
+    NXdata
+        The data converted to the CHESS format, with axes labeled
+        'H', 'K', and optionally 'L', and the signal labeled 'counts'.
+    """
+    root = nxload(path)
+
     hlim, klim, llim = root.lower_limits
     hstep, kstep, lstep = root.step_sizes
-    h = NXfield(np.linspace(hlim, -hlim, int(np.abs(hlim * 2) / hstep) + 1), name='H')
-    k = NXfield(np.linspace(klim, -klim, int(np.abs(klim * 2) / kstep) + 1), name='K')
-    l = NXfield(np.linspace(llim, -llim, int(np.abs(llim * 2) / lstep) + 1), name='L')
-    data = NXdata(NXfield(root.data[:, :, :], name='counts'), (h, k, l))
+
+    shape = root.data.shape
+
+    if len(shape) == 2:
+        nh, nk = shape
+
+        h = NXfield(hlim + np.arange(nh) * hstep, name="H")
+        k = NXfield(klim + np.arange(nk) * kstep, name="K")
+
+        data = NXdata(
+            NXfield(root.data[:, :], name="counts"),
+            (h, k),
+        )
+
+    elif len(shape) == 3:
+        nh, nk, nl = shape
+
+        h = NXfield(hlim + np.arange(nh) * hstep, name="H")
+        k = NXfield(klim + np.arange(nk) * kstep, name="K")
+        l = NXfield(llim + np.arange(nl) * lstep, name="L")
+
+        data = NXdata(
+            NXfield(root.data[:, :, :], name="counts"),
+            (h, k, l),
+        )
+
+    else:
+        raise ValueError(
+            f"Unsupported data dimensionality ({len(shape)}D). "
+            "Only 2D and 3D DISCUS datasets are supported."
+        )
 
     return data

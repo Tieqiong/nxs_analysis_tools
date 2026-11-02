@@ -13,6 +13,12 @@ chess
 .. automodule:: nxs_analysis_tools.chess
     :members:
 
+reciprocal
+----------
+
+.. automodule:: nxs_analysis_tools.reciprocal
+    :members:
+
 fitting
 -----
 
